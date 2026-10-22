@@ -1,0 +1,16 @@
+# Entorno y archivos generados
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Salidas locales del procesador
+demo_entrada/
+demo_salida/
+entrada/
+salida/
+procesadas/
+
+# Configuracion local
+.vscode/settings.json
+.env
