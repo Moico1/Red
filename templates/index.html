@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Image Lab | Procesamiento concurrente</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark">IL</span><span>IMAGE LAB</span></div>
+      <span class="status-pill"><i></i> Motor listo</span>
+    </header>
+
+    <section class="intro">
+      <p class="eyebrow">PROCESAMIENTO VISUAL CONCURRENTE</p>
+      <h1>Tu lote de imágenes,<br><em>en otra frecuencia.</em></h1>
+      <p class="lede">Sube varias imágenes, combina estilos y deja que el asistente prepare una configuración rápida para tu lote.</p>
+    </section>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, message in messages %}<div class="notice {{ category }}">{{ message }}</div>{% endfor %}
+    {% endwith %}
+
+    <form action="{{ url_for('process_images') }}" method="post" enctype="multipart/form-data" id="lab-form">
+      <section class="workspace">
+        <div class="upload-panel" id="drop-zone">
+          <input type="file" name="images" id="images" accept=".jpg,.jpeg,.png,.bmp,.webp,.tiff" multiple hidden>
+          <div class="upload-icon">↑</div>
+          <h2>Arrastra tus imágenes aquí</h2>
+          <p>o elige archivos desde tu dispositivo</p>
+          <button type="button" class="outline-button" id="browse">Seleccionar imágenes</button>
+          <button type="button" class="text-button" id="clear-files" hidden>Quitar todas</button>
+          <small>JPG, PNG, BMP, WEBP o TIFF · hasta 100 MB</small>
+          <div class="file-list" id="file-list"></div>
+          <div class="recommendation" id="recommendation" hidden></div>
+        </div>
+
+        <aside class="controls">
+          <div class="section-heading"><span>01</span><h2>Estilo</h2></div>
+          <p class="helper">Puedes elegir más de un filtro. Se creará una variante por cada combinación.</p>
+          <div class="filter-grid">
+            {% for key, label in filters.items() %}
+            <label class="filter-option"><input type="checkbox" name="filters" value="{{ key }}" {% if key == 'grayscale' %}checked{% endif %}><span>{{ label }}</span></label>
+            {% endfor %}
+          </div>
+
+          <div class="section-heading second"><span>02</span><h2>Concurrencia</h2></div>
+          <p class="helper">Elige cómo se reparte el trabajo. Una tarea es una imagen con un filtro aplicado.</p>
+          <div class="mode-options">
+            {% for key, label in modes.items() %}
+            <label class="mode-option"><input type="radio" name="mode" value="{{ key }}" data-help="{{ mode_help[key] }}" {% if key == 'processes' %}checked{% endif %}><span>{{ label }}</span></label>
+            {% endfor %}
+          </div>
+          <p class="mode-help" id="mode-help">{{ mode_help['processes'] }}</p>
+          <label class="workers-label" for="workers">Tareas simultáneas <output id="worker-value">4</output></label>
+          <input type="range" name="workers" id="workers" min="1" max="16" value="4">
+          <div class="output-heading"><span>03</span><h2>Salida</h2></div>
+          <div class="output-grid">
+            <label>Formato<select name="output_format"><option value="PNG">PNG · máxima calidad</option><option value="JPEG">JPG · archivos ligeros</option><option value="WEBP">WEBP · web y móvil</option></select></label>
+            <label>Lado máximo (px)<input type="number" name="max_dimension" min="0" max="8000" step="1" inputmode="numeric" placeholder="Original"></label>
+          </div>
+          <button class="primary-button" type="submit" id="submit">Procesar lote <span>→</span></button>
+          <div class="result-summary" id="result-summary" hidden></div>
+          <p class="privacy">Tus imágenes se procesan temporalmente y no se almacenan.</p>
+        </aside>
+      </section>
+    </form>
+
+    <section class="game-panel" id="game-panel" hidden aria-live="polite">
+      <div class="game-header"><div><p class="eyebrow">MODO ESPERA</p><h2>Atrapa las tareas</h2></div><div class="game-score"><span>PUNTOS</span><strong id="game-score">0</strong></div></div>
+      <p class="game-copy">Toca los nodos antes de que desaparezcan. Cada carril representa una tarea concurrente.</p>
+      <div class="game-board" id="game-board"></div>
+      <div class="game-footer"><span id="game-status">Procesando tu lote...</span><span>Mejor: <b id="game-best">0</b></span></div>
+    </section>
+
+    <footer><span>IMAGE LAB / 2026</span><span>CPU · MULTI-THREAD · MULTI-PROCESS</span></footer>
+  </main>
+  <script>
+    const input = document.querySelector('#images');
+    const drop = document.querySelector('#drop-zone');
+    const list = document.querySelector('#file-list');
+    const submit = document.querySelector('#submit');
+    const form = document.querySelector('#lab-form');
+    const clearFiles = document.querySelector('#clear-files');
+    let selectedFiles = [];
+    let gameTimer;
+    let gameScore = 0;
+    let gameBest = Number(localStorage.getItem('image-lab-best') || 0);
+    document.querySelector('#game-best').textContent = gameBest;
+    const supported = ['jpg', 'jpeg', 'png', 'bmp', 'webp', 'tiff'];
+    const syncInput = () => {
+      const transfer = new DataTransfer();
+      selectedFiles.forEach(file => transfer.items.add(file));
+      input.files = transfer.files;
+    };
+    const stopGame = () => {
+      clearInterval(gameTimer);
+      document.querySelector('#game-panel').hidden = true;
+      document.querySelector('#game-board').innerHTML = '';
+    };
+    const startGame = () => {
+      const panel = document.querySelector('#game-panel');
+      const board = document.querySelector('#game-board');
+      gameScore = 0;
+      document.querySelector('#game-score').textContent = '0';
+      document.querySelector('#game-status').textContent = 'Procesando tu lote...';
+      panel.hidden = false;
+      board.innerHTML = '';
+      for (let lane = 0; lane < 4; lane += 1) {
+        const track = document.createElement('div');
+        track.className = 'game-lane';
+        track.innerHTML = `<span class="lane-label">TAREA ${String(lane + 1).padStart(2, '0')}</span><span class="lane-line"></span>`;
+        board.appendChild(track);
+      }
+      gameTimer = setInterval(() => {
+        const lanes = board.querySelectorAll('.game-lane');
+        const lane = lanes[Math.floor(Math.random() * lanes.length)];
+        const node = document.createElement('button');
+        node.type = 'button';
+        node.className = 'task-node';
+        node.textContent = '✦';
+        node.style.left = `${Math.floor(Math.random() * 78) + 10}%`;
+        node.addEventListener('click', () => {
+          gameScore += 1;
+          document.querySelector('#game-score').textContent = gameScore;
+          node.remove();
+        }, { once: true });
+        lane.appendChild(node);
+        setTimeout(() => node.remove(), 1800);
+      }, 520);
+    };
+    const recommend = () => {
+      const totalMb = selectedFiles.reduce((sum, file) => sum + file.size, 0) / 1024 / 1024;
+      const count = selectedFiles.length;
+      const workers = Math.max(1, Math.min(8, navigator.hardwareConcurrency ? navigator.hardwareConcurrency - 1 : 4));
+      let recommendation;
+      if (totalMb >= 80 || count >= 30) recommendation = { mode: 'processes', format: 'WEBP', max: 1600, reason: 'lote grande: reducimos el tamaño y usamos varios núcleos' };
+      else if (totalMb >= 20 || count >= 10) recommendation = { mode: 'threads', format: 'WEBP', max: 1920, reason: 'lote mediano: equilibrio entre velocidad y calidad' };
+      else recommendation = { mode: 'threads', format: 'PNG', max: 0, reason: 'lote pequeño: conservamos la calidad original' };
+      document.querySelector(`input[name="mode"][value="${recommendation.mode}"]`).checked = true;
+      document.querySelector(`select[name="output_format"]`).value = recommendation.format;
+      document.querySelector('input[name="max_dimension"]').value = recommendation.max || '';
+      document.querySelector('#workers').value = workers;
+      document.querySelector('#worker-value').value = workers;
+      document.querySelector('#mode-help').textContent = 'Recomendado por el asistente: ' + recommendation.reason + '.';
+      const panel = document.querySelector('#recommendation');
+      panel.hidden = false;
+      panel.innerHTML = `<b>Asistente de rendimiento</b><span>${recommendation.mode === 'processes' ? 'Procesos' : 'Hilos'} · ${workers} tareas · ${recommendation.format}${recommendation.max ? ` · máximo ${recommendation.max}px` : ''}</span><small>${(totalMb).toFixed(1)} MB totales en ${count} imagen${count === 1 ? '' : 'es'}. Es una recomendación de velocidad y peso; el estilo lo eliges tú.</small>`;
+    };
+    const renderFiles = () => {
+      list.innerHTML = selectedFiles.map((file, index) => `<div class="file-row"><img src="${URL.createObjectURL(file)}" alt=""><span>${file.name}</span><b>${(file.size / 1024 / 1024).toFixed(1)} MB</b><button type="button" class="remove-file" data-index="${index}" aria-label="Quitar ${file.name}">×</button></div>`).join('');
+      drop.classList.toggle('has-files', selectedFiles.length > 0);
+      clearFiles.hidden = selectedFiles.length === 0;
+      submit.disabled = selectedFiles.length === 0;
+      submit.innerHTML = selectedFiles.length ? `Procesar ${selectedFiles.length} imagen${selectedFiles.length === 1 ? '' : 'es'} <span>→</span>` : 'Procesar lote <span>→</span>';
+      if (selectedFiles.length) recommend();
+      list.querySelectorAll('.remove-file').forEach(button => button.addEventListener('click', () => {
+        selectedFiles.splice(Number(button.dataset.index), 1);
+        syncInput();
+        renderFiles();
+      }));
+    };
+    document.querySelector('#browse').addEventListener('click', () => input.click());
+    input.addEventListener('change', () => {
+      selectedFiles = [...selectedFiles, ...[...input.files].filter(file => supported.includes(file.name.split('.').pop().toLowerCase()))];
+      selectedFiles = selectedFiles.filter((file, index, files) => index === files.findIndex(other => other.name === file.name && other.size === file.size));
+      syncInput();
+      renderFiles();
+    });
+    ['dragenter', 'dragover'].forEach(event => drop.addEventListener(event, e => { e.preventDefault(); drop.classList.add('dragging'); }));
+    ['dragleave', 'drop'].forEach(event => drop.addEventListener(event, e => { e.preventDefault(); drop.classList.remove('dragging'); }));
+    drop.addEventListener('drop', e => {
+      selectedFiles = [...selectedFiles, ...[...e.dataTransfer.files].filter(file => supported.includes(file.name.split('.').pop().toLowerCase()))];
+      syncInput();
+      renderFiles();
+    });
+    clearFiles.addEventListener('click', () => { selectedFiles = []; syncInput(); renderFiles(); });
+    document.querySelector('#workers').addEventListener('input', e => document.querySelector('#worker-value').value = e.target.value);
+    document.querySelectorAll('input[name="mode"]').forEach(option => option.addEventListener('change', e => {
+      document.querySelector('#mode-help').textContent = e.target.dataset.help;
+      document.querySelector('#workers').disabled = e.target.value === 'sequential';
+      if (e.target.value === 'sequential') document.querySelector('#worker-value').value = '1';
+    }));
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      submit.disabled = true;
+      submit.innerHTML = 'Procesando... <span class="spinner">◌</span>';
+      startGame();
+      try {
+        const response = await fetch(form.action, { method: 'POST', body: new FormData(form) });
+        if (!response.ok) throw new Error('No se pudo completar el procesamiento');
+        const blob = await response.blob();
+        const download = document.createElement('a');
+        download.href = URL.createObjectURL(blob);
+        download.download = response.headers.get('Content-Disposition')?.match(/filename="?([^";]+)"?/)?.[1] || 'image-lab-resultados.zip';
+        download.click();
+        URL.revokeObjectURL(download.href);
+        submit.innerHTML = 'Descargado. Procesar otra vez <span>↻</span>';
+        const modeNames = { processes: 'procesos', threads: 'hilos', sequential: 'uno a uno' };
+        const summary = document.querySelector('#result-summary');
+        summary.hidden = false;
+        summary.innerHTML = `<b>Procesamiento terminado</b><span>${response.headers.get('X-Processed-Images')} resultados descargados · ${response.headers.get('X-Processing-Tasks')} tareas · ${response.headers.get('X-Processing-Seconds')} s</span><small>Modo: ${modeNames[response.headers.get('X-Processing-Mode')]} · ${response.headers.get('X-Processing-Workers')} tareas simultáneas.</small>`;
+        if (gameScore > gameBest) { gameBest = gameScore; localStorage.setItem('image-lab-best', gameBest); document.querySelector('#game-best').textContent = gameBest; }
+        document.querySelector('#game-status').textContent = `Lote listo · ${gameScore} tareas atrapadas`;
+      } catch (error) {
+        submit.innerHTML = 'Error. Intentar de nuevo <span>↻</span>';
+        document.querySelector('#game-status').textContent = 'No se pudo completar el lote';
+      } finally {
+        clearInterval(gameTimer);
+        submit.disabled = false;
+        setTimeout(stopGame, 3200);
+      }
+    });
+  </script>
+</body>
+</html>
